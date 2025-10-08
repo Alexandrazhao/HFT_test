@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Orderbook Turnover Rates</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at top, #10131a, #050608 65%);
+      color: #f4f6fb;
+    }
+    body { margin: 0; min-height: 100vh; display: flex; align-items: stretch; justify-content: center; }
+    main { width: min(960px, 92vw); padding: 40px 24px 80px; }
+    header { display: flex; flex-direction: column; gap: 12px; margin-bottom: 28px; }
+    h1 { font-size: clamp(28px, 4vw, 40px); margin: 0; font-weight: 700; letter-spacing: -0.5px; }
+    #runtime-config { opacity: 0.65; font-size: 14px; }
+    #status { font-size: 14px; width: fit-content; border-radius: 999px; padding: 4px 14px; text-transform: uppercase; letter-spacing: 0.14em; font-weight: 600; }
+    #status[data-state="ok"] { background: rgba(34,197,94,0.16); color: #93f6b9; }
+    #status[data-state="connecting"], #status[data-state="info"] { background: rgba(96,165,250,0.18); color: #bfdbfe; }
+    #status[data-state="error"] { background: rgba(239,68,68,0.18); color: #fecaca; }
+
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 18px; margin-bottom: 36px; }
+    .metric-card { background: rgba(15,21,33,0.78); border: 1px solid rgba(148,163,184,0.2); border-radius: 16px; padding: 18px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); display: flex; flex-direction: column; gap: 8px; }
+    .metric-label { font-size: 13px; text-transform: uppercase; letter-spacing: 0.18em; opacity: 0.6; }
+    .metric-value { font-size: clamp(22px, 3vw, 30px); font-weight: 600; }
+    .metric-sub { font-size: 13px; opacity: 0.5; }
+
+    .chart-card { background: rgba(15,21,33,0.78); border-radius: 20px; border: 1px solid rgba(148,163,184,0.2); padding: 24px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+    canvas { width: 100%; height: auto; border-radius: 12px; background: rgba(3,7,18,0.65); border: 1px solid rgba(59,130,246,0.12); }
+    .chart-caption { font-size: 13px; margin-top: 12px; opacity: 0.55; text-align: center; }
+
+    .empty { text-align: center; opacity: 0.45; font-size: 15px; margin-top: 24px; }
+
+    @media (max-width: 520px) {
+      main { padding: 32px 16px 64px; }
+      .metric-card { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Orderbook Turnover Rates</h1>
+      <p id="runtime-config">Loading defaults…</p>
+      <span id="status" data-state="connecting">Connecting…</span>
+    </header>
+
+    <section class="metrics">
+      <div class="metric-card">
+        <span class="metric-label">Bid placements</span>
+        <span class="metric-value" id="bid-placements">0</span>
+        <span class="metric-sub">orders/min</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Ask placements</span>
+        <span class="metric-value" id="ask-placements">0</span>
+        <span class="metric-sub">orders/min</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Total changes</span>
+        <span class="metric-value" id="total-changes">0</span>
+        <span class="metric-sub">orders/min</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Orders per minute</span>
+        <span class="metric-value" id="orders-per-minute">0.0</span>
+        <span class="metric-sub">last streamed minute</span>
+      </div>
+    </section>
+
+    <section class="chart-card">
+      <canvas id="turnover-chart" width="900" height="360"></canvas>
+      <p class="chart-caption">Turnover volume per minute across the last hour. Bid line in cyan, ask line in amber.</p>
+      <p class="empty" id="empty-hint">Waiting for turnover data…</p>
+    </section>
+  </main>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
