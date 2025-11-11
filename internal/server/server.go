@@ -68,14 +68,53 @@ func (s *Server) handleTurnoverStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	ctx := r.Context()
-	id, ch := agg.RegisterIndicator(window, 60)
+    // Optional VPIN config
+    if v := r.URL.Query().Get("vpinBucket"); v != "" {
+        if q, err := strconv.ParseFloat(v, 64); err == nil && q > 0 {
+            agg.SetVPINBucketQuote(q)
+        }
+    }
+    if v := r.URL.Query().Get("vpinWindow"); v != "" {
+        if m, err := strconv.Atoi(v); err == nil && m > 0 {
+            agg.SetVPINWindowMin(m)
+        }
+    }
+    // Optional VPIN mode: base or quote
+    if v := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("vpinMode"))); v != "" {
+        switch v {
+        case "base":
+            agg.SetVPINUseBase(true)
+        case "quote":
+            agg.SetVPINUseBase(false)
+        }
+    }
+    if v := r.URL.Query().Get("vpinBucketBase"); v != "" {
+        if b, err := strconv.ParseFloat(v, 64); err == nil && b > 0 {
+            agg.SetVPINBucketBase(b)
+        }
+    }
+    // Optional Butterworth toggle on trade flow
+    if v := r.URL.Query().Get("butter"); v != "" {
+        enable := v == "1" || strings.ToLower(v) == "true" || strings.ToLower(v) == "on"
+        cutoff := 0.05
+        if c := r.URL.Query().Get("butterCutoff"); c != "" {
+            if fc, err := strconv.ParseFloat(c, 64); err == nil {
+                cutoff = fc
+            }
+        }
+        agg.EnableButterworth(enable, cutoff)
+    }
+
+    id, ch := agg.RegisterIndicator(window, 60)
 	defer agg.UnregisterIndicator(id)
 
     type payload struct {
         Timestamp       int64                       `json:"ts"`
+        VPIN            float64                     `json:"vpin"`
         TurnoverRate    orderbook.TurnoverRate      `json:"turnoverRate"`
         TurnoverHistory []orderbook.TurnoverHistory `json:"turnoverHistory"`
         CumBins         []float64                   `json:"cumBins"`
+        Imbalance       float64                     `json:"imbalance"`
     }
 
 	for {
@@ -86,9 +125,11 @@ func (s *Server) handleTurnoverStream(w http.ResponseWriter, r *http.Request) {
 			}
             data, err := json.Marshal(payload{
                 Timestamp:       indicator.Timestamp,
+                VPIN:            indicator.VPIN,
                 TurnoverRate:    indicator.TurnoverRate,
                 TurnoverHistory: indicator.TurnoverHistory,
                 CumBins:         indicator.CumBins,
+                Imbalance:       indicator.Imbalance,
             })
 			if err != nil {
 				continue
@@ -128,12 +169,13 @@ func (s *Server) handleDefaults(w http.ResponseWriter, r *http.Request) {
 	if venue == "us" {
 		mkt = orderbook.MarketSpot
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"symbol": sym,
-		"market": string(mkt),
-		"venue":  venue,
-	})
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]any{
+        "symbol": sym,
+        "market": string(mkt),
+        "venue":  venue,
+        // frontend can seed controls; Butterworth defaults are not exposed directly here
+    })
 }
 
 func parseSymbolMarket(r *http.Request) (string, orderbook.Market) {

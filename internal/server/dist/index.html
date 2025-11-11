@@ -68,12 +68,72 @@
         <span class="metric-value" id="orders-per-minute">0.0</span>
         <span class="metric-sub">last streamed minute</span>
       </div>
+      <div class="metric-card">
+        <span class="metric-label">VPIN</span>
+        <div style="display:flex; align-items:flex-end; gap:10px;">
+          <span class="metric-value" id="vpin">0.00</span>
+          <canvas id="vpin-spark" width="120" height="28" style="flex:0 0 120px; height:28px; border-radius:6px; background:rgba(3,7,18,0.45); border:1px solid rgba(59,130,246,0.12)"></canvas>
+        </div>
+        <span class="metric-sub">Trade VPIN · 60m avg</span>
+      </div>
     </section>
 
     <section class="chart-card">
       <canvas id="turnover-chart" width="900" height="360"></canvas>
       <p class="chart-caption">Turnover volume per minute across the last hour. Bid line in cyan, ask line in amber.</p>
       <p class="empty" id="empty-hint">Waiting for turnover data…</p>
+    </section>
+
+    <section class="chart-card" style="margin-top:16px;">
+      <canvas id="vpin-chart" width="900" height="180"></canvas>
+      <p class="chart-caption">VPIN over time (latest 2 hours). Lower indicates more balanced flow.</p>
+    </section>
+
+    <section class="chart-card" style="margin-top:16px;">
+      <canvas id="vpin-filtered-chart" width="900" height="180"></canvas>
+      <p class="chart-caption">Filtered VPIN (EMA low-pass, α=<span id="vpin-alpha-label">0.20</span>) for smoother trend.</p>
+    </section>
+
+    <section class="chart-card" style="margin-top:16px; padding:16px 18px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+      <strong style="opacity:0.85; margin-right:6px;">VPIN Settings</strong>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        Bucket (quote):
+        <input id="vpin-bucket" type="number" min="1" step="1000" value="50000" style="width:110px; padding:6px 8px; border-radius:8px; background:rgba(2,6,23,0.6); color:#e5e7eb; border:1px solid rgba(148,163,184,0.25);">
+      </label>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        Bucket (base):
+        <input id="vpin-bucket-base" type="number" min="0.00000001" step="0.0001" value="10" style="width:110px; padding:6px 8px; border-radius:8px; background:rgba(2,6,23,0.6); color:#e5e7eb; border:1px solid rgba(148,163,184,0.25);">
+      </label>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        Mode:
+        <select id="vpin-mode" style="padding:6px 8px; border-radius:8px; background:rgba(2,6,23,0.6); color:#e5e7eb; border:1px solid rgba(148,163,184,0.25);">
+          <option value="quote" selected>Quote</option>
+          <option value="base">Base</option>
+        </select>
+      </label>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        Window (min):
+        <input id="vpin-window" type="number" min="1" step="1" value="60" style="width:80px; padding:6px 8px; border-radius:8px; background:rgba(2,6,23,0.6); color:#e5e7eb; border:1px solid rgba(148,163,184,0.25);">
+      </label>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        Overlay filtered on raw:
+        <input id="vpin-overlay-toggle" type="checkbox" style="transform: translateY(1px);">
+      </label>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        Butterworth on trades:
+        <input id="butter-toggle" type="checkbox" style="transform: translateY(1px);">
+      </label>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        fc (Nyquist frac):
+        <input id="butter-cutoff" type="number" min="0.01" max="0.49" step="0.01" value="0.05" style="width:80px; padding:6px 8px; border-radius:8px; background:rgba(2,6,23,0.6); color:#e5e7eb; border:1px solid rgba(148,163,184,0.25);">
+      </label>
+      <label style="font-size:13px; opacity:0.8; display:flex; align-items:center; gap:6px;">
+        EMA α:
+        <input id="vpin-alpha" type="range" min="0.05" max="0.5" step="0.01" value="0.20" style="width:160px;">
+        <span id="vpin-alpha-readout" style="font-variant-numeric: tabular-nums;">0.20</span>
+      </label>
+      <button id="apply-vpin" style="padding:8px 12px; border-radius:10px; background:rgba(59,130,246,0.2); color:#c7d2fe; border:1px solid rgba(59,130,246,0.35); cursor:pointer;">Apply</button>
+      <span style="font-size:12px; opacity:0.6;">Applies instantly and reconnects the stream</span>
     </section>
 
     <section class="chart-card" style="margin-top:16px">

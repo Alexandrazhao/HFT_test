@@ -104,6 +104,18 @@ func BookTickerStreamURLFor(market Market, symbol string) string {
 	return base + WSBookTickerPath(symbol)
 }
 
+// AggTradesPath returns the aggTrades stream path for a symbol.
+func AggTradesPath(symbol string) string {
+    return fmt.Sprintf("/ws/%s@aggTrade", strings.ToLower(symbol))
+}
+
+// AggTradesStreamURLFor returns full WS URL for aggTrades stream (spot WS base).
+func AggTradesStreamURLFor(market Market, symbol string) string {
+    cfg := LoadEndpointConfig()
+    base := cfg.SpotWSBase
+    return base + AggTradesPath(symbol)
+}
+
 // DepthSnapshotURLFor returns full HTTP URL for depth snapshot (no query parameters).
 func DepthSnapshotURLFor(market Market) string {
 	cfg := LoadEndpointConfig()

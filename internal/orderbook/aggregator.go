@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"nhooyr.io/websocket"
+    "nhooyr.io/websocket"
 )
 
 const (
@@ -91,19 +91,32 @@ type BookPatch struct {
 
 // PricePoint captures a mid-price sample for the chart.
 type PricePoint struct {
-	Time int64   `json:"t"`
-	Mid  float64 `json:"mid"`
+    Time int64   `json:"t"`
+    Mid  float64 `json:"mid"`
+}
+
+// tradeBucket accumulates trade flow until a target quote volume is reached
+type tradeBucket struct {
+    startMS int64
+    endMS   int64
+    buyQ    float64 // quote volume
+    sellQ   float64 // quote volume
+    volQ    float64 // total quote vol
 }
 
 // IndicatorData represents the calculated indicators for orderbook analysis
 type IndicatorData struct {
     Timestamp       int64             `json:"ts"`
     Imbalance       float64           `json:"imbalance"`
+    VPIN            float64           `json:"vpin"`
     TurnoverRate    TurnoverRate      `json:"turnoverRate"`
     TurnoverHistory []TurnoverHistory `json:"turnoverHistory"`
     // Cumulative volume bins (100 contracts per bin) around mid
     // Each entry is the absolute buy/sell volume difference within the bin.
     CumBins []float64 `json:"cumBins"`
+    // Debug fields
+    VPINBucketCount int   `json:"vpinBucketCount"`
+    VPINLastBucket  int64 `json:"vpinLastBucket"`
 }
 
 // TurnoverRate represents real-time turnover metrics
@@ -125,11 +138,11 @@ type TurnoverHistory struct {
 }
 
 type minuteTurnover struct {
-	bidPlacements int
-	bidRemovals   int
-	askPlacements int
-	askRemovals   int
-	ordersCount   int
+    bidPlacements int
+    bidRemovals   int
+    askPlacements int
+    askRemovals   int
+    ordersCount   int
 }
 
 type aggregatorState int
@@ -231,7 +244,28 @@ type Aggregator struct {
 
 	bookUpdates      chan bookUpdate
 	pricePoints      chan PricePoint
-	indicatorUpdates chan IndicatorData
+    indicatorUpdates chan IndicatorData
+
+    // trades / VPIN (trade-based)
+    tradeMu         sync.Mutex
+    tradeBuckets    []tradeBucket // rolling buckets (newest at end)
+    currentBucket   tradeBucket
+    vpinBucketQuote float64 // quote volume per bucket (e.g., 50000)
+    vpinWindowMin   int     // minutes to average over
+    vpinUseBase     bool    // if true, bucket by base qty; else quote notional
+    vpinBucketBase  float64 // base units per bucket when in base mode
+
+    // Butterworth low-pass filter on signed trade flow (pre-VPIN)
+    butterEnabled bool
+    butterCutoff  float64 // normalized cutoff (0<fc<0.5) at 1 Hz sampling
+    // biquad coefficients/state
+    bw_b0, bw_b1, bw_b2 float64
+    bw_a1, bw_a2        float64
+    bw_x1, bw_x2        float64
+    bw_y1, bw_y2        float64
+    // 1 Hz sampler for signed flow
+    sampSecond int64   // unix second for current bin
+    sampAccum  float64 // accumulated signed volume within current second
 
 	logMu   sync.Mutex
 	diffLog *os.File
@@ -258,21 +292,119 @@ func NewAggregator(symbol string, market Market, window float64, client *http.Cl
 		indicatorSubs:    make(map[int]*indicatorSubscriber),
 		bookUpdates:      make(chan bookUpdate, 256),
 		pricePoints:      make(chan PricePoint, 256),
-		indicatorUpdates: make(chan IndicatorData, 256),
-	}
+        indicatorUpdates: make(chan IndicatorData, 256),
+        vpinBucketQuote:  50000,
+        vpinWindowMin:    60,
+        vpinUseBase:      false,
+        vpinBucketBase:   10, // default e.g., 10 base units
+        butterEnabled:    false,
+        butterCutoff:     0.05,
+    }
 }
 
 func (a *Aggregator) Start() {
-	go a.runDepth()
-	go a.runTicker()
-	go a.bookFanoutLoop()
-	go a.priceFanoutLoop()
-	go a.indicatorFanoutLoop()
+    go a.runDepth()
+    go a.runTicker()
+    go a.runAggTrades()
+    go a.bookFanoutLoop()
+    go a.priceFanoutLoop()
+    go a.indicatorFanoutLoop()
 }
 
 func (a *Aggregator) Stop() {
-	a.cancel()
-	a.closeLogs()
+    a.cancel()
+    // flush any pending 1 Hz sample through the filter when stopping
+    a.tradeMu.Lock()
+    if a.butterEnabled && a.sampSecond != 0 {
+        filtered := a.butterworthStep(a.sampAccum)
+        if filtered >= 0 {
+            a.appendTrade(a.sampSecond*1000, filtered, false)
+        } else {
+            a.appendTrade(a.sampSecond*1000, -filtered, true)
+        }
+        a.sampSecond = 0
+        a.sampAccum = 0
+    }
+    a.tradeMu.Unlock()
+    a.closeLogs()
+}
+
+// SetVPINBucketQuote sets the target quote volume per VPIN bucket.
+func (a *Aggregator) SetVPINBucketQuote(q float64) {
+    if q <= 0 {
+        return
+    }
+    a.tradeMu.Lock()
+    a.vpinBucketQuote = q
+    a.tradeMu.Unlock()
+}
+
+// SetVPINWindowMin sets the averaging window for trade VPIN in minutes.
+func (a *Aggregator) SetVPINWindowMin(m int) {
+    if m <= 0 {
+        return
+    }
+    a.tradeMu.Lock()
+    a.vpinWindowMin = m
+    a.tradeMu.Unlock()
+}
+
+// SetVPINUseBase toggles VPIN bucket mode between base (true) and quote (false).
+func (a *Aggregator) SetVPINUseBase(useBase bool) {
+    a.tradeMu.Lock()
+    a.vpinUseBase = useBase
+    a.tradeMu.Unlock()
+}
+
+// SetVPINBucketBase sets the base-volume bucket size when in base mode.
+func (a *Aggregator) SetVPINBucketBase(b float64) {
+    if b <= 0 {
+        return
+    }
+    a.tradeMu.Lock()
+    a.vpinBucketBase = b
+    a.tradeMu.Unlock()
+}
+
+// EnableButterworth enables a 2nd-order Butterworth LPF on signed trade flow.
+// cutoff is normalized to 1 Hz sample (0<cutoff<0.5). When disabled, raw trades are used.
+func (a *Aggregator) EnableButterworth(enable bool, cutoff float64) {
+    a.tradeMu.Lock()
+    defer a.tradeMu.Unlock()
+    a.butterEnabled = enable
+    if cutoff <= 0 || cutoff >= 0.5 {
+        cutoff = 0.05
+    }
+    a.butterCutoff = cutoff
+    a.initButterCoeffs()
+}
+
+func (a *Aggregator) initButterCoeffs() {
+    // 2nd-order Butterworth LPF via bilinear transform; normalized sample rate 1 Hz
+    fc := a.butterCutoff
+    if fc <= 0 { fc = 0.05 }
+    wc := math.Tan(math.Pi * fc)
+    k1 := math.Sqrt2 * wc
+    k2 := wc * wc
+    den := 1 + k1 + k2
+    a.bw_b0 = k2 / den
+    a.bw_b1 = 2 * a.bw_b0
+    a.bw_b2 = a.bw_b0
+    a.bw_a1 = 2 * (k2 - 1) / den
+    a.bw_a2 = (1 - k1 + k2) / den
+    // reset state
+    a.bw_x1, a.bw_x2 = 0, 0
+    a.bw_y1, a.bw_y2 = 0, 0
+}
+
+func (a *Aggregator) butterworthStep(x float64) float64 {
+    // Direct Form I biquad
+    y := a.bw_b0*x + a.bw_b1*a.bw_x1 + a.bw_b2*a.bw_x2 - a.bw_a1*a.bw_y1 - a.bw_a2*a.bw_y2
+    a.bw_x2 = a.bw_x1
+    a.bw_x1 = x
+    a.bw_y2 = a.bw_y1
+    a.bw_y1 = y
+    return y
 }
 
 func (a *Aggregator) runDepth() {
@@ -320,6 +452,179 @@ func (a *Aggregator) runTicker() {
 			}
 		}
 	}
+}
+
+// runAggTrades connects to Binance aggTrades stream and accumulates trade-based volume buckets
+func (a *Aggregator) runAggTrades() {
+    backoff := minBackoff
+    for {
+        if err := a.aggTradesLoop(); err != nil {
+            if errors.Is(err, context.Canceled) {
+                return
+            }
+            fmt.Printf("aggregator(%s) aggTrades: %v\n", a.symbol, err)
+        }
+        select {
+        case <-a.ctx.Done():
+            return
+        case <-time.After(addJitter(backoff)):
+        }
+        if backoff < maxBackoff {
+            backoff *= 2
+            if backoff > maxBackoff {
+                backoff = maxBackoff
+            }
+        }
+    }
+}
+
+func (a *Aggregator) aggTradesLoop() error {
+    ctx, cancel := context.WithCancel(a.ctx)
+    defer cancel()
+    streamURL := AggTradesStreamURLFor(a.market, a.symbol)
+    ws, _, err := websocket.Dial(ctx, streamURL, nil)
+    if err != nil {
+        return err
+    }
+    ws.SetReadLimit(1 << 20)
+    defer ws.Close(websocket.StatusNormalClosure, "shutdown")
+
+    type aggTrade struct {
+        Price string `json:"p"`
+        Qty   string `json:"q"`
+        Time  int64  `json:"T"`
+        Maker bool   `json:"m"`
+    }
+
+    for {
+        _, data, err := ws.Read(ctx)
+        if err != nil {
+            if websocket.CloseStatus(err) == websocket.StatusNormalClosure || errors.Is(err, context.Canceled) {
+                return nil
+            }
+            return err
+        }
+        var t aggTrade
+        if err := json.Unmarshal(data, &t); err != nil {
+            continue
+        }
+        price, _ := strconv.ParseFloat(t.Price, 64)
+        qty, _ := strconv.ParseFloat(t.Qty, 64)
+        if t.Time == 0 || qty <= 0 || price <= 0 {
+            continue
+        }
+        // Use base or quote per mode
+        var vol float64
+        a.tradeMu.Lock()
+        useBase := a.vpinUseBase
+        butter := a.butterEnabled
+        a.tradeMu.Unlock()
+        if useBase {
+            vol = qty
+        } else {
+            vol = price * qty
+        }
+        // Signed flow: buy positive, sell negative (maker=true means sell)
+        signed := vol
+        if t.Maker { signed = -vol }
+        if butter {
+            // Fixed 1 Hz sampling: accumulate signed flow within the trade's second,
+            // on second change, run one Butterworth step with the bin sum.
+            sec := t.Time / 1000
+            a.tradeMu.Lock()
+            if a.sampSecond == 0 {
+                a.sampSecond = sec
+            }
+            if sec != a.sampSecond {
+                // emit filtered value for previous second
+                filtered := a.butterworthStep(a.sampAccum)
+                // route to buckets preserving sign
+                if filtered >= 0 {
+                    a.appendTrade(a.sampSecond*1000, filtered, false)
+                } else {
+                    a.appendTrade(a.sampSecond*1000, -filtered, true)
+                }
+                // reset for new second
+                a.sampSecond = sec
+                a.sampAccum = 0
+            }
+            a.sampAccum += signed
+            a.tradeMu.Unlock()
+        } else {
+            a.appendTrade(t.Time, vol, t.Maker)
+        }
+    }
+}
+
+func (a *Aggregator) appendTrade(tsMS int64, vol float64, maker bool) {
+    a.tradeMu.Lock()
+    defer a.tradeMu.Unlock()
+    // init bucket start
+    if a.currentBucket.startMS == 0 {
+        a.currentBucket.startMS = tsMS
+    }
+    if maker {
+        // seller-initiated => sell volume
+        a.currentBucket.sellQ += vol
+    } else {
+        a.currentBucket.buyQ += vol
+    }
+    // Track bucketed volume in the correct unit per mode
+    // When using base mode, vol is base units; otherwise vol is quote notional
+    a.currentBucket.volQ += vol
+    a.currentBucket.endMS = tsMS
+
+    // pick threshold depending on mode (same unit as `vol` above)
+    threshold := a.vpinBucketQuote
+    if a.vpinUseBase && a.vpinBucketBase > 0 {
+        threshold = a.vpinBucketBase
+    }
+    if a.currentBucket.volQ >= threshold && threshold > 0 {
+        // finalize bucket
+        done := a.currentBucket
+        a.tradeBuckets = append(a.tradeBuckets, done)
+        // cap buckets to window (approx minutes -> assume target avg bucket duration variable; keep last N buckets ~= window*60s)
+        if len(a.tradeBuckets) > 600 { // safety cap
+            a.tradeBuckets = a.tradeBuckets[len(a.tradeBuckets)-600:]
+        }
+        // reset
+        a.currentBucket = tradeBucket{}
+    }
+}
+
+func (a *Aggregator) calculateTradeVPIN() float64 {
+    a.tradeMu.Lock()
+    defer a.tradeMu.Unlock()
+    if len(a.tradeBuckets) == 0 {
+        return 0
+    }
+    // Consider only buckets whose midpoint time is within the last vpinWindowMin minutes
+    cutoff := time.Now().Add(-time.Duration(a.vpinWindowMin) * time.Minute).UnixMilli()
+    var sum, count float64
+    for i := len(a.tradeBuckets) - 1; i >= 0; i-- {
+        b := a.tradeBuckets[i]
+        mid := b.endMS
+        if mid < cutoff {
+            break
+        }
+        // Normalize by actual filled bucket volume to ensure <= 1
+        denom := b.volQ
+        if denom <= 0 {
+            continue
+        }
+        v := math.Abs(b.buyQ-b.sellQ) / denom
+        if v < 0 { v = 0 }
+        if v > 1 { v = 1 }
+        sum += v
+        count++
+    }
+    if count == 0 {
+        return 0
+    }
+    avg := sum / count
+    if avg < 0 { avg = 0 }
+    if avg > 1 { avg = 1 }
+    return avg
 }
 
 func (a *Aggregator) syncLoop() error {
@@ -1007,6 +1312,153 @@ func (a *Aggregator) calculateTurnoverRate() TurnoverRate {
 	}
 }
 
+// calculateTurnoverImbalance computes bid/ask change ratio over the last windowSec seconds
+// using the minuteTracker (placements + removals per side). Falls back to 1.0 if ask==0.
+func (a *Aggregator) calculateTurnoverImbalance(windowSec int) float64 {
+    if windowSec <= 0 {
+        windowSec = 60
+    }
+    a.turnoverMu.RLock()
+    defer a.turnoverMu.RUnlock()
+
+    // Find latest minute key we have (event-time truncated to minute)
+    var latest int64
+    for k := range a.minuteTracker {
+        if k > latest {
+            latest = k
+        }
+    }
+    if latest == 0 {
+        return 1.0
+    }
+
+    // Sum across buckets overlapping [latest - windowSec, latest)
+    // minute keys are second-level epoch truncated to minute boundaries.
+    start := latest - int64(windowSec)
+    var bidSum, askSum int
+    for mk, m := range a.minuteTracker {
+        if mk >= start && mk <= latest {
+            bidSum += m.bidPlacements + m.bidRemovals
+            askSum += m.askPlacements + m.askRemovals
+        }
+    }
+    if askSum == 0 {
+        return 1.0
+    }
+    return float64(bidSum) / float64(askSum)
+}
+
+// calculateVPIN computes a simplified VPIN (Volume-Synchronized PIN) proxy using
+// turnover placements/removals as volume proxies. It forms equally sized
+// volume buckets (bucketVol) by walking back through completed minute bins and
+// accumulates bid and ask activity until the bucket threshold is met. VPIN is
+// the average absolute order-imbalance per bucket over a rolling window.
+// bucketVol is in "order events" units here (since we do not have trade size).
+// windowMin controls how many minutes to include (completed minutes only).
+// Deprecated: turnover-proxy VPIN using order-change counts. Kept for reference but not used.
+func (a *Aggregator) calculateVPIN(bucketVol int, windowMin int) float64 {
+    if bucketVol <= 0 {
+        bucketVol = 50
+    }
+    if windowMin <= 0 {
+        windowMin = 60
+    }
+
+    a.turnoverMu.RLock()
+    defer a.turnoverMu.RUnlock()
+
+    // Find latest completed minute key
+    var latest int64
+    for k := range a.minuteTracker {
+        if k > latest {
+            latest = k
+        }
+    }
+    if latest == 0 {
+        return 0
+    }
+    latestCompleted := latest - 60
+
+    // Walk back windowMin minutes collecting minute bins newest->oldest
+    bins := make([]*minuteTurnover, 0, windowMin)
+    for i := 0; i < windowMin; i++ {
+        mk := latestCompleted - int64(60*i)
+        if m := a.minuteTracker[mk]; m != nil {
+            bins = append(bins, m)
+        } else {
+            // include empty minute (no activity)
+            bins = append(bins, &minuteTurnover{})
+        }
+    }
+
+    // Build volume-synchronized buckets
+    type bucket struct{ b, a int }
+    var cur bucket
+    var buckets []bucket
+    push := func() {
+        if cur.b == 0 && cur.a == 0 {
+            return
+        }
+        buckets = append(buckets, cur)
+        cur = bucket{}
+    }
+
+    for _, m := range bins {
+        // Approximate bid/ask volume for the minute as total changes per side
+        b := m.bidPlacements + m.bidRemovals
+        a := m.askPlacements + m.askRemovals
+        sideTotal := b + a
+        if sideTotal == 0 {
+            continue
+        }
+        // Fill the current bucket with this minute's activity
+        remaining := sideTotal
+        // Simple split by side proportions
+        for remaining > 0 {
+            need := bucketVol - (cur.b + cur.a)
+            if need <= 0 {
+                push()
+                continue
+            }
+            take := need
+            if take > remaining {
+                take = remaining
+            }
+            // Proportionally allocate to b/a for this chunk
+            var tb, ta int
+            if b+a > 0 {
+                tb = int(math.Round(float64(take) * float64(b) / float64(b+a)))
+                if tb > take {
+                    tb = take
+                }
+                ta = take - tb
+            } else {
+                ta = take
+            }
+            cur.b += tb
+            cur.a += ta
+            remaining -= take
+            // If filled, push bucket
+            if cur.b+cur.a >= bucketVol {
+                push()
+            }
+        }
+    }
+    // push tail if partially filled; classical VPIN often excludes last partial bucket,
+    // but we include it to keep the metric responsive.
+    push()
+
+    if len(buckets) == 0 {
+        return 0
+    }
+    // VPIN = average(|B - A|) / bucketVol
+    var sum float64
+    for _, bk := range buckets {
+        sum += math.Abs(float64(bk.b-bk.a)) / float64(bucketVol)
+    }
+    return sum / float64(len(buckets))
+}
+
 func (a *Aggregator) getTurnoverHistory(historyLen int) []TurnoverHistory {
 	if historyLen <= 0 {
 		historyLen = 60 // Default to 60 minutes
@@ -1067,7 +1519,8 @@ func (a *Aggregator) queueIndicatorUpdate(ts int64, mid float64) {
         ts = time.Now().UnixMilli()
     }
 
-    imbalance := a.calculateImbalance(mid)
+    // Use turnover-based imbalance over the last 60 seconds
+    imbalance := a.calculateTurnoverImbalance(60)
     turnoverRate := a.calculateTurnoverRate()
     turnoverHistory := a.getTurnoverHistory(60) // 1 hour of history
     cumBins := a.calculateCumulativeBins(mid, 100.0) // 100 contracts per bin
@@ -1287,7 +1740,17 @@ func (a *Aggregator) broadcastIndicator(indicator IndicatorData) {
 		// Customize imbalance per-subscriber using their requested window around BBO mid
 		custom := indicator
         if mid != 0 {
-            custom.Imbalance = a.calculateImbalanceWithWindow(mid, sub.window)
+            // Keep instantaneous imbalance per-subscriber if needed later; now use turnover-based 60s
+            custom.Imbalance = a.calculateTurnoverImbalance(60)
+            // Use trade-based VPIN exclusively; do not fall back to turnover proxy
+            custom.VPIN = a.calculateTradeVPIN()
+            // Debug: include bucket stats
+            a.tradeMu.Lock()
+            custom.VPINBucketCount = len(a.tradeBuckets)
+            if len(a.tradeBuckets) > 0 {
+                custom.VPINLastBucket = a.tradeBuckets[len(a.tradeBuckets)-1].endMS
+            }
+            a.tradeMu.Unlock()
             // Recompute bins per subscriber centered at current mid
             custom.CumBins = a.calculateCumulativeBins(mid, 100.0)
         }
